@@ -13,6 +13,7 @@ Tools:
 """
 
 import os
+import re
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -21,17 +22,34 @@ from utils.data_loader import load_listings
 
 load_dotenv()
 
+# Model used for the two LLM-backed tools (suggest_outfit, create_fit_card).
+_GROQ_MODEL = "llama-3.3-70b-versatile"
+
+# Words that carry no filtering signal — ignored when scoring keyword overlap.
+_STOPWORDS = {
+    "a", "an", "the", "for", "with", "and", "or", "of", "to", "in", "on",
+    "my", "i", "im", "looking", "want", "need", "some", "any", "that", "this",
+    "under", "below", "less", "than", "size", "sized", "cheap", "find", "me",
+    "something", "really", "very", "would", "like", "love", "please",
+}
+
 
 # ── Groq client ───────────────────────────────────────────────────────────────
 
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
     api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
+    if not api_key or api_key == "your_key_here":
         raise ValueError(
             "GROQ_API_KEY not set. Add it to a .env file in the project root."
         )
     return Groq(api_key=api_key)
+
+
+def _tokenize(text: str) -> list[str]:
+    """Lowercase a string and split it into meaningful word tokens."""
+    words = re.findall(r"[a-z0-9]+", text.lower())
+    return [w for w in words if w not in _STOPWORDS and len(w) > 1]
 
 
 # ── Tool 1: search_listings ───────────────────────────────────────────────────
@@ -69,8 +87,48 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+    query_tokens = _tokenize(description)
+
+    scored: list[tuple[int, dict]] = []
+    for item in listings:
+        # 1. Price filter (inclusive). Skip if over budget.
+        if max_price is not None and item.get("price", 0) > max_price:
+            continue
+
+        # 2. Size filter (case-insensitive substring so "M" matches "S/M").
+        if size:
+            item_size = str(item.get("size", "")).lower()
+            if size.strip().lower() not in item_size:
+                continue
+
+        # 3. Score by keyword overlap. Title/style_tags hits weigh more than
+        #    description hits so the most on-topic listings rank first.
+        title_tokens = set(_tokenize(item.get("title", "")))
+        tag_tokens = set(_tokenize(" ".join(item.get("style_tags", []))))
+        category_tokens = set(_tokenize(item.get("category", "")))
+        desc_tokens = set(_tokenize(item.get("description", "")))
+
+        score = 0
+        for token in query_tokens:
+            if token in title_tokens:
+                score += 3
+            if token in tag_tokens:
+                score += 3
+            if token in category_tokens:
+                score += 2
+            if token in desc_tokens:
+                score += 1
+
+        # 4. Drop listings with no keyword relevance at all.
+        #    (If the description was only stopwords, fall back to size/price
+        #    matches so the user still gets results.)
+        if score > 0 or not query_tokens:
+            scored.append((score, item))
+
+    # 5. Sort by score, highest first (stable — keeps dataset order on ties).
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +158,56 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    item_desc = _format_item_for_prompt(new_item)
+    items = (wardrobe or {}).get("items", [])
+
+    if not items:
+        # Empty-wardrobe branch: no pieces to name, so give general advice.
+        prompt = (
+            "You are a thoughtful personal stylist. A user just found this "
+            "secondhand item but hasn't told you anything they already own:\n\n"
+            f"{item_desc}\n\n"
+            "Suggest one or two complete outfits to build AROUND this piece. "
+            "Since you don't know their wardrobe, describe the kinds of pieces "
+            "(silhouettes, colors, shoes) that would pair well and the overall "
+            "vibe. Keep it to 3-4 sentences, concrete and friendly."
+        )
+        fallback = (
+            f"Great find! Build around the {new_item.get('title', 'piece')} with "
+            "simple basics: a fitted or relaxed bottom in a neutral tone, clean "
+            "sneakers or boots, and one layering piece (a denim or canvas jacket). "
+            "Let the item be the statement and keep everything else low-key."
+        )
+    else:
+        # Populated-wardrobe branch: name real pieces from their closet.
+        wardrobe_lines = "\n".join(
+            f"- {it.get('name', 'item')} "
+            f"({it.get('category', '?')}; {', '.join(it.get('colors', []))})"
+            for it in items
+        )
+        prompt = (
+            "You are a thoughtful personal stylist. A user just found this "
+            "secondhand item:\n\n"
+            f"{item_desc}\n\n"
+            "Here is what they already own:\n"
+            f"{wardrobe_lines}\n\n"
+            "Suggest one or two complete outfits that pair this new item with "
+            "SPECIFIC named pieces from their wardrobe above. Mention the pieces "
+            "by name, add a small styling tip (cuffing, tucking, layering), and "
+            "name the overall vibe. Keep it to 3-4 sentences."
+        )
+        first_two = ", ".join(it.get("name", "a piece") for it in items[:2])
+        fallback = (
+            f"Pair the {new_item.get('title', 'new piece')} with your {first_two}. "
+            "Keep the proportions balanced, add a layering piece if it's cool out, "
+            "and let the new item anchor the look."
+        )
+
+    return _chat(
+        prompt,
+        temperature=0.7,
+        fallback=fallback,
+    )
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +239,71 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty / whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Can't write a fit card without an outfit suggestion — "
+            "run suggest_outfit first."
+        )
+
+    title = new_item.get("title", "this piece")
+    price = new_item.get("price")
+    platform = new_item.get("platform", "")
+    price_str = f"${price:g}" if isinstance(price, (int, float)) else "a steal"
+
+    # 2. Build the prompt.
+    prompt = (
+        "Write a short, casual social-media caption (2-4 sentences) for an "
+        "outfit-of-the-day post about a secondhand find. Sound like a real "
+        "person sharing their thrift haul — NOT a product description.\n\n"
+        f"Item: {title}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n"
+        f"Outfit: {outfit}\n\n"
+        "Mention the item name, price, and platform naturally, once each. "
+        "Capture the outfit vibe in specific terms. A tasteful emoji or two is "
+        "fine. Return only the caption text."
+    )
+
+    # 3. Call the LLM (high temperature so captions vary), with a templated
+    #    fallback if the call fails.
+    fallback = (
+        f"thrifted this {title.lower()} off {platform} for {price_str} and "
+        "i'm obsessed — styled it exactly how i pictured. full look soon ✨"
+    )
+    return _chat(prompt, temperature=0.9, fallback=fallback)
+
+
+# ── shared LLM helper ─────────────────────────────────────────────────────────
+
+def _format_item_for_prompt(item: dict) -> str:
+    """Render a listing dict into a compact, prompt-friendly description."""
+    return (
+        f"{item.get('title', 'Unknown item')} "
+        f"(category: {item.get('category', '?')}; "
+        f"colors: {', '.join(item.get('colors', [])) or 'n/a'}; "
+        f"style: {', '.join(item.get('style_tags', [])) or 'n/a'}; "
+        f"${item.get('price', '?')} on {item.get('platform', '?')})"
+    )
+
+
+def _chat(prompt: str, temperature: float, fallback: str) -> str:
+    """
+    Call Groq with a single user prompt and return the text.
+
+    Any failure (missing/invalid key, network error, rate limit, empty
+    response) is caught and the provided `fallback` string is returned instead,
+    so the LLM-backed tools never raise or return an empty string.
+    """
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=_GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=temperature,
+            max_tokens=400,
+        )
+        text = (response.choices[0].message.content or "").strip()
+        return text if text else fallback
+    except Exception:
+        return fallback
